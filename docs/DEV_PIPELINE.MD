@@ -1,8 +1,8 @@
 # Numeraire — Development Pipeline
 
 **Companion to:** `docs/ARCHITECTURE.md` (the v1 design baseline)
-**Purpose:** An executable, phase-ordered build plan with agent task assignment for Codex and Claude Code.
-**Assumed operator:** One engineer directing two coding agents.
+**Purpose:** An executable, phase-ordered build plan for implementing Numeraire with Claude Code.
+**Assumed operator:** One engineer working with Claude Code.
 
 ---
 
@@ -15,7 +15,7 @@ Each phase has the same shape:
 | **Objective** | The single capability the phase adds |
 | **Depends on** | Phases that must be merged first |
 | **Deliverables** | Files, mapped to the structure in ARCHITECTURE.md §5 |
-| **Task table** | Work items with owner (Codex / Claude Code / You) and parallelism |
+| **Task table** | Work items with an execution mode and parallelism flag |
 | **Exit criteria** | Verifiable conditions. Not "feels done" — commands that pass |
 | **Traps** | Failure modes specific to this phase, worth pre-empting |
 
@@ -23,54 +23,56 @@ A phase is not complete until every exit criterion passes on a clean checkout. P
 
 ---
 
-## 1. Agent Operating Model
+## 1. Working Model
 
-### 1.1 The split
+### 1.1 Execution modes
 
-The two agents are not interchangeable, and treating them as such is the fastest way to produce a codebase that drifts from its own architecture.
+Everything is implemented with Claude Code, but not everything should be implemented the same way. Four modes, used deliberately:
 
-**Claude Code** — interactive, repo-wide context, runs the test suite in-loop, iterates on failures. Use it where the work requires judgment across files or where getting it wrong is expensive.
-
-**Codex** — asynchronous, sandboxed, task-per-PR, parallelizable across many concurrent tasks. Use it where the specification is complete enough that a correct implementation is mechanically derivable and a test suite can prove it.
+| Mode | What it is | Use when |
+|---|---|---|
+| **Main** | You and Claude Code in the primary session, iterating together, running tests in-loop | The work requires judgment, touches an invariant, or crosses a layer boundary |
+| **Sub** | Delegated to a subagent from the main session; returns results without flooding your context | The task is closed and self-verifying, or is a research/audit pass whose intermediate output you will never re-read |
+| **Par** | A separate session in its own git worktree, on its own branch | The task is independent of what the main session is touching, and you want it progressing in parallel |
+| **You** | Human, no agent | Decisions, merges, and the demo |
 
 The governing rule:
 
-> **Claude Code establishes the pattern. Codex replicates it.**
-> **Claude Code owns anything that touches an invariant or crosses a layer boundary.**
+> **The main session establishes the pattern. Delegated and parallel sessions replicate it.**
+> **The main session owns anything that touches a financial invariant or crosses a layer boundary.**
 
 Concretely:
 
-| Work type | Owner | Why |
+| Work type | Mode | Why |
 |---|---|---|
-| Repo scaffolding, build/test harness, CI | Claude Code | Needs to be tuned against real command output |
-| Pure domain functions with a written contract | Codex | Spec-complete, dependency-free, provable by tests |
-| Database triggers, constraints, migrations | Claude Code | Wrong = silent data corruption; needs a live DB to iterate |
-| Drizzle table definitions transcribed from §7 | Codex | Near-verbatim from spec; mechanical |
-| Unit of Work, repository base classes, DI wiring | Claude Code | Cross-cutting; sets the pattern everything else copies |
-| Nth CRUD module after the 1st exists | Codex | Pattern-following; parallel across modules |
-| CSV parsers, column mappers, bank profiles | Codex | Pure + fixture-testable; ideal isolated task |
-| Auth, token rotation, security surfaces | Claude Code | Security-critical; review cost exceeds build cost |
-| Prompt construction, tool loop, output validation | Claude Code | Adversarial design work; needs iteration against real output |
-| Individual AI tool handlers (one per tool) | Codex | Each is one scoped query + Zod schema + row cap |
-| Metrics instrumentation across routes/queues | Codex | Repetitive, low-judgment |
-| Test fixtures, adversarial corpora, seed data | Codex | Volume work; benefits from parallel generation |
-| Debugging a failing integration test | Claude Code | Requires running the thing |
-| Reviewing every Codex PR | Claude Code | Non-negotiable — see 1.4 |
+| Repo scaffolding, build/test harness, CI | Main | Needs tuning against real command output |
+| Pure domain functions with a written contract | Par | Spec-complete, dependency-free, provable by tests |
+| Database triggers, constraints, migrations | Main | Wrong = silent data corruption; needs a live DB to iterate |
+| Drizzle table definitions transcribed from §7 | Par | Near-verbatim from spec; mechanical |
+| Unit of Work, repository base classes, DI wiring | Main | Cross-cutting; sets the pattern everything else copies |
+| Nth CRUD module after the 1st exists | Par | Pattern-following; independent across modules |
+| CSV parsers, column mappers, bank profiles | Par | Pure + fixture-testable; ideal isolated task |
+| Auth, token rotation, security surfaces | Main | Security-critical; review cost exceeds build cost |
+| Prompt construction, tool loop, output validation | Main | Adversarial design work; needs iteration against real output |
+| Individual AI tool handlers (one per tool) | Par | Each is one scoped query + Zod schema + row cap |
+| Metrics instrumentation across routes/queues | Sub | Repetitive, low-judgment, verifiable by a single command |
+| Test fixtures, adversarial corpora, seed data | Sub | Volume work; you never need the intermediate reasoning |
+| Codebase exploration before a refactor | Sub | Keeps a large read out of your main context |
+| Debugging a failing integration test | Main | Requires running the thing and reading real output |
+| Reviewing any branch you did not watch being written | Sub, fresh context | See 1.4 |
 
-### 1.2 Repo contract files (built in Phase 0, never skipped)
+### 1.2 Repo contract file (built in Phase 0, never skipped)
 
-Both agents read a project instruction file. Keep one source of truth and have the other point at it.
-
-**`AGENTS.md`** — the substance. Codex reads this. Contents:
+**`CLAUDE.md`** is the standing contract. Keep it short — it is loaded into every session, and long instruction files get diluted.
 
 ```markdown
-# Numeraire — Agent Contract
+# Numeraire
 
 ## Non-negotiable invariants
 - Money is `bigint` minor units. No `number`, `float`, `parseFloat`, or
   `toFixed` anywhere in a money code path. Serialize to JSON as a string.
 - `src/domain/**` imports nothing from `src/db`, `src/modules`, `src/ai`,
-  `src/jobs`, or any npm package with I/O. Enforced by dependency-cruiser.
+  `src/jobs`, or any package with I/O. Enforced by dependency-cruiser.
 - Every repository method that reads or writes a tenant row takes `userId`
   and includes it in the WHERE clause. There is no `findById(id)`.
 - Split lines must sum to the parent transaction amount. Never bypass
@@ -84,8 +86,9 @@ Both agents read a project instruction file. Keep one source of truth and have t
 1. `npm run verify` passes (typecheck, lint, format, unit tests, boundaries)
 2. New code has tests. Domain code has table-driven or property tests.
 3. No new `any`, no `@ts-expect-error` without a comment naming the reason.
-4. If a route changed, the OpenAPI snapshot test is regenerated intentionally.
-5. If a decision deviates from ARCHITECTURE.md, stop and write an ADR instead.
+4. If a route changed, the OpenAPI snapshot is regenerated intentionally.
+5. If a decision deviates from docs/ARCHITECTURE.md, stop and ask. Do not
+   resolve architectural ambiguity unilaterally — propose an ADR instead.
 
 ## Conventions
 - Zod schema per boundary object, colocated in `*.schemas.ts`.
@@ -93,65 +96,109 @@ Both agents read a project instruction file. Keep one source of truth and have t
 - Time comes from the injected `Clock`, never `new Date()` in domain or services.
 - IDs come from `lib/ids.ts` (UUIDv7), never `crypto.randomUUID()` inline.
 - Log via the request-scoped child logger. Never `console.*`.
+
+## Workflow
+- Use plan mode for any task spanning more than three files.
+- Run `npm run verify` before proposing a commit, not after being asked.
+- Reference docs/ARCHITECTURE.md by section number rather than restating it.
 ```
 
-**`CLAUDE.md`** — points at `AGENTS.md`, then adds Claude Code-specific operating notes: which slash commands exist, when to use plan mode, which subagents are configured, what to run before proposing a PR.
+### 1.3 `.claude/` setup
 
-**`.claude/`** — commands, subagents, and hooks:
+**Slash commands** (`.claude/commands/`):
 
-- `commands/verify.md` — run the full gate and summarize failures
-- `commands/review-pr.md` — the Codex PR review checklist as a repeatable command
-- `commands/new-module.md` — scaffold a vertical slice against the canonical pattern
-- `agents/invariant-auditor.md` — read-only subagent that greps the diff for money-as-float, unscoped repo access, and enqueue-inside-transaction
-- `settings.json` hooks — a `PostToolUse` hook running `tsc --noEmit` on edited TS files, and a `PreToolUse` hook that blocks writes to `drizzle/*.sql` files already present in `HEAD`
+| Command | Does |
+|---|---|
+| `/verify` | Runs the full gate, summarizes failures grouped by cause |
+| `/phase <n>` | Loads the phase brief from this document and enters plan mode |
+| `/review <branch>` | Runs the review checklist against a diff |
+| `/new-module <name>` | Scaffolds a vertical slice against the canonical accounts pattern |
+| `/exit-audit <n>` | Verifies each phase exit criterion individually, citing the test that proves it |
 
-The hooks matter more than the instructions. An instruction in `CLAUDE.md` is followed most of the time; a hook is enforced every time. Put anything that would be catastrophic if violated into a hook, not into prose.
+**Subagents** (`.claude/agents/`):
 
-### 1.3 Writing a Codex task
+| Subagent | Tools | Purpose |
+|---|---|---|
+| `invariant-auditor` | Read, Grep, Glob | Read-only. Scans a diff for float money math, unscoped repository access, enqueue-inside-transaction, and domain-layer import violations |
+| `test-writer` | Read, Write, Edit, Bash | Given an enumerated case list, writes the test file and iterates until it runs |
+| `fixture-builder` | Read, Write, Bash | Generates fixture corpora (bank CSVs, adversarial AI responses) — high volume, no reasoning you need to see |
+| `sql-reviewer` | Read, Grep, Bash | Reviews aggregate SQL for transfer exclusion, soft-delete filters, and tenant scoping |
 
-Codex works well when the task is closed. Use this template:
+**Hooks** (`.claude/settings.json`) — these matter more than the prose in `CLAUDE.md`. An instruction is followed most of the time; a hook fires every time. Put anything catastrophic-if-violated here:
+
+| Event | Hook |
+|---|---|
+| `PreToolUse` on Write/Edit | Block writes to any `drizzle/*.sql` file already present in `HEAD` |
+| `PostToolUse` on Write/Edit of `*.ts` | Run `tsc --noEmit` on the project and surface errors immediately |
+| `PostToolUse` on Write/Edit under `src/domain/` | Run `./scripts/check-invariants.sh` |
+| `Stop` | Warn if the working tree has uncommitted changes and the unit suite is red |
+
+### 1.4 The review gate
+
+You will not watch every line get written — that is the point of delegating and running parallel worktrees. Which means the substitute for a second pair of eyes is **a fresh context reviewing work it did not produce.**
+
+Run `/review <branch>` in a session that did not write the branch, or delegate to the `invariant-auditor` subagent. Reviewing in the same session that wrote the code is close to worthless: the session is anchored on its own reasoning and will confirm it.
+
+The review checks, in order:
+
+1. Does it violate anything in the invariants list?
+2. Are the tests testing behavior, or asserting the implementation back at itself?
+3. Does it introduce a layer-boundary violation dependency-cruiser would miss — e.g. a domain function taking a Drizzle type as a parameter?
+4. Does it silently widen a type, swallow an error, or catch-and-log?
+5. Is there dead code from an abandoned approach?
+
+Report first, fix second. A review prompt that permits fixing inline turns into a session that quietly rewrites the branch and reports it as clean.
+
+### 1.5 Running parallel worktrees
+
+For **Par** tasks:
+
+```bash
+git worktree add ../numeraire-categories -b feat/categories
+cd ../numeraire-categories && npm ci
+claude   # new session, own context, own branch
+```
+
+Practical limits:
+
+- **Two or three concurrent worktrees, maximum.** The bottleneck is your review capacity, not agent throughput. Four branches you have not read is worse than two you have.
+- Parallel sessions must not share files. The task tables below mark `Par` only where the file sets are disjoint.
+- Docker services are shared. Give each worktree its own test database name, or run integration tests serially in the main worktree.
+- Rebase parallel branches onto the phase base before review, so the diff you read is the diff that will merge.
+
+### 1.6 Writing a task brief
+
+Whether for a subagent or a parallel session, a closed task performs far better than an open one:
 
 ```markdown
 ## Task: <one line>
 
 ### Context
 Read: docs/ARCHITECTURE.md §<n>, src/domain/money/money.ts (reference pattern),
-AGENTS.md
+CLAUDE.md
 
 ### Build
 <Exact files to create. Exact exported signatures. Copy type definitions
 verbatim from the architecture doc where they exist.>
 
 ### Test
-<Enumerated cases the tests must cover, including the edge cases. If there
-is a fixture directory, name it.>
+<Enumerated cases the tests must cover, including edge cases. Name the
+fixture directory if one exists.>
 
 ### Do not
 - Touch any file outside the list above
-- Add a dependency without justifying it in the PR description
+- Add a dependency without justifying it
 - Modify existing migrations
 
 ### Done when
 `npm run verify` passes and coverage on the new files is >= <n>%.
 ```
 
-The two lines that most improve Codex output are the reference-pattern pointer and the enumerated test cases. A task that says "write a CSV column mapper" produces something plausible; a task that lists the twelve header shapes it must resolve produces something correct.
+The two lines that most improve output are the reference-pattern pointer and the enumerated test cases. "Write a CSV column mapper" produces something plausible; a list of the twelve header shapes it must resolve produces something correct.
 
-### 1.4 The review gate
+### 1.7 What you own personally
 
-**No Codex PR merges without a Claude Code review.** Run `/review-pr` with the diff in context. The review checks, in order:
-
-1. Does it violate anything in the invariants list?
-2. Are the tests actually testing behavior, or asserting the implementation back at itself?
-3. Does it introduce a layer-boundary violation dependency-cruiser would miss (e.g. a domain function taking a Drizzle type as a parameter)?
-4. Does it silently widen a type, swallow an error, or catch-and-log?
-5. Is there dead code from an abandoned approach?
-
-This is the highest-value use of Claude Code in the whole pipeline. Parallel agent output is only an accelerant if something is filtering it.
-
-### 1.5 What you own personally
-
-- Every ADR. If an agent wants to deviate from the architecture, it stops and asks; you decide.
+- Every ADR. If a session wants to deviate from the architecture, it stops and asks; you decide.
 - The sign convention and the split invariant. Read those tests yourself, line by line, once.
 - Merge decisions.
 - The demo. Phase 12 exists because a reviewer's first thirty seconds decide the rest.
@@ -160,23 +207,23 @@ This is the highest-value use of Claude Code in the whole pipeline. Parallel age
 
 ## 2. Phase Map
 
-| # | Phase | Depends on | Primary owner | Est. |
+| # | Phase | Depends on | Dominant mode | Est. |
 |---|---|---|---|---|
-| 0 | Repo Foundation & Agent Harness | — | Claude Code | 1–2 d |
-| 1 | Domain Core (pure) | 0 | Codex | 2–3 d |
-| 2 | Persistence & Invariants | 1 | Claude Code | 3–4 d |
-| 3 | Transport & Auth | 2 | Claude Code | 2–3 d |
-| 4 | Core Resource Modules | 3 | Mixed | 4–5 d |
-| 5 | Async Spine (queues, rollups) | 4 | Claude Code | 3–4 d |
-| 6 | Read Models (insights, budgets) | 5 | Codex | 2–3 d |
-| 7 | Import Pipeline | 5 | Codex | 3–4 d |
-| 8 | Deterministic Categorization | 7 | Mixed | 3–4 d |
-| 9 | AI Infrastructure | 8 | Claude Code | 3–4 d |
-| 10 | Assistant (tool-calling) | 6, 9 | Mixed | 3–4 d |
-| 11 | Observability & Hardening | 10 | Mixed | 2–3 d |
-| 12 | Seed, UI, Docs, Release | 11 | Mixed | 3–4 d |
+| 0 | Repo Foundation & Harness | — | Main | 1–2 d |
+| 1 | Domain Core (pure) | 0 | Par | 2–3 d |
+| 2 | Persistence & Invariants | 1 | Main | 3–4 d |
+| 3 | Transport & Auth | 2 | Main | 2–3 d |
+| 4 | Core Resource Modules | 3 | Main → Par | 4–5 d |
+| 5 | Async Spine (queues, rollups) | 4 | Main | 3–4 d |
+| 6 | Read Models (insights, budgets) | 5 | Par | 2–3 d |
+| 7 | Import Pipeline | 5 | Par | 3–4 d |
+| 8 | Deterministic Categorization | 7 | Main → Par | 3–4 d |
+| 9 | AI Infrastructure | 8 | Main | 3–4 d |
+| 10 | Assistant (tool-calling) | 6, 9 | Main → Par | 3–4 d |
+| 11 | Observability & Hardening | 10 | Sub + Main | 2–3 d |
+| 12 | Seed, UI, Docs, Release | 11 | Sub + You | 3–4 d |
 
-Total: roughly 6–8 weeks of focused part-time work, or 3–4 weeks full-time.
+Total: roughly 6–8 weeks part-time, or 3–4 weeks full-time.
 
 ### Critical path
 
@@ -185,7 +232,7 @@ Total: roughly 6–8 weeks of focused part-time work, or 3–4 weeks full-time.
                       └→ 6 ──────────────↗
 ```
 
-Phase 6 branches off Phase 5 and rejoins at Phase 10. Once Phase 5 merges, run 6 and 7 concurrently — 6 to Codex, 7 to Codex, and use Claude Code to review both.
+Phase 6 branches off Phase 5 and rejoins at Phase 10. Once Phase 5 merges, run 6 and 7 as two worktrees while the main session handles review and integration.
 
 ### Rule about phase order
 
@@ -193,39 +240,39 @@ Do not reorder to build the AI subsystem earlier. It is the most interesting par
 
 ---
 
-## Phase 0 — Repo Foundation & Agent Harness
+## Phase 0 — Repo Foundation & Harness
 
 **Objective:** A repository where every subsequent task is verifiable by one command.
 **Depends on:** nothing.
-**Owner:** Claude Code, interactively, start to finish. Do not delegate this.
+**Mode:** Main, start to finish. Do not delegate any of this.
 
 ### Deliverables
 
 ```
-package.json            tsconfig.json           .eslintrc / eslint.config.js
+package.json            tsconfig.json           eslint.config.js
 .prettierrc             vitest.config.ts        drizzle.config.ts
 Dockerfile (multi-stage: development | production)
 docker-compose.yml      docker-compose.test.yml
 .env.example            .github/workflows/ci.yml
 .dependency-cruiser.js  scripts/check-invariants.sh
-AGENTS.md               CLAUDE.md               .claude/{commands,agents,settings.json}
+CLAUDE.md               .claude/{commands,agents,settings.json}
 src/config/env.ts       src/config/constants.ts
 src/lib/{logger,clock,ids,result}.ts
 ```
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 0.1 | `package.json`, TS 5.x `strict: true`, path aliases, npm scripts | Claude Code | — |
-| 0.2 | ESLint + Prettier + `no-restricted-syntax` rules banning float money ops | Claude Code | — |
-| 0.3 | Vitest config: separate `unit` / `integration` / `api` projects | Claude Code | — |
-| 0.4 | dependency-cruiser: forbid `src/domain` → anything with I/O | Claude Code | — |
-| 0.5 | Compose: postgres:16 + redis:7 with healthchecks; test compose on ephemeral ports | Claude Code | — |
-| 0.6 | `src/config/env.ts` — full Zod schema from ARCHITECTURE.md §16 | Codex | ✔ |
-| 0.7 | `lib/`: pino logger with redaction serializer, injectable Clock, UUIDv7, `Result<T,E>` | Codex | ✔ |
-| 0.8 | CI workflow: the §19.3 job list, coverage gate stubbed at 0 initially | Claude Code | — |
-| 0.9 | `AGENTS.md`, `CLAUDE.md`, `.claude/` commands, subagent, hooks | Claude Code | — |
+| 0.1 | `package.json`, TS 5.x `strict: true`, path aliases, npm scripts | Main | — |
+| 0.2 | ESLint + Prettier + `no-restricted-syntax` rules banning float money ops | Main | — |
+| 0.3 | Vitest config: separate `unit` / `integration` / `api` projects | Main | — |
+| 0.4 | dependency-cruiser: forbid `src/domain` → anything with I/O | Main | — |
+| 0.5 | Compose: postgres:16 + redis:7 with healthchecks; test compose on ephemeral ports | Main | — |
+| 0.6 | `src/config/env.ts` — full Zod schema from ARCHITECTURE.md §16 | Main | — |
+| 0.7 | `lib/`: pino logger with redaction serializer, injectable Clock, UUIDv7, `Result<T,E>` | Sub | — |
+| 0.8 | CI workflow: the §19.3 job list, coverage gate stubbed at 0 initially | Main | — |
+| 0.9 | `CLAUDE.md`, slash commands, subagents, hooks | Main | — |
 
 ### The verify script
 
@@ -267,12 +314,14 @@ exit $fail
 - `docker compose up -d` yields healthy `postgres` and `redis`
 - `npm run dev:api` boots, fails loudly and legibly on a missing `DATABASE_URL`
 - CI is green on the first push
-- A deliberate test violation (add `parseFloat` to a domain file) makes `npm run boundaries` fail
+- A deliberate violation (add `parseFloat` to a domain file) makes `npm run boundaries` fail
+- The `PreToolUse` hook actually blocks an attempted edit to a committed migration — test it once, by hand
 
 ### Traps
 
-- **Do not let an agent write feature code before this exists.** Every hour spent here is repaid across every subsequent phase, because "done" becomes machine-checkable instead of a judgment call.
+- **Do not write feature code before this exists.** Every hour spent here is repaid across every subsequent phase, because "done" becomes machine-checkable instead of a judgment call.
 - Configure Vitest projects now, not later. Retrofitting a fast-unit / slow-integration split after 200 tests exist is annoying work nobody wants to do.
+- **Verify the hooks fire.** A misconfigured hook fails silently, and you will believe you have a guardrail you do not have.
 
 ---
 
@@ -280,7 +329,7 @@ exit $fail
 
 **Objective:** All financial logic, dependency-free and fully tested, before a database exists.
 **Depends on:** 0.
-**Owner:** Claude Code writes the first module as reference; Codex builds the rest in parallel.
+**Mode:** Main writes the reference module; the rest run as parallel worktrees.
 
 ### Deliverables
 
@@ -294,20 +343,24 @@ src/domain/errors.ts
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 1.1 | `money.ts` — `Minor`, `Money`, add/sub/negate/abs/compare, `allocate()` largest-remainder, `parseMinor`, `formatMinor`. **Reference implementation — written first, reviewed by hand.** | Claude Code | — |
-| 1.2 | `errors.ts` — full `AppError` taxonomy from §15.1 | Codex | ✔ |
-| 1.3 | `ledger/transaction.ts` — `assertSplitsBalance`, sign normalization per account kind, valid status transitions | Codex | ✔ |
-| 1.4 | `ledger/transfer.ts` — pair validation: distinct accounts, opposite signs, magnitude within tolerance, date proximity window | Codex | ✔ |
-| 1.5 | `categorization/rule-matcher.ts` — all five match types, priority ordering, first-match-wins, ReDoS-safe regex evaluation | Codex | ✔ |
-| 1.6 | `categorization/confidence.ts` — threshold routing to `categorized` vs `needs_review` | Codex | ✔ |
-| 1.7 | `recurring/detector.ts` — periodicity inference from date deltas, MAD-based amount tolerance, cadence classification, `nextExpectedAt` | Codex | ✔ |
-| 1.8 | Property tests for `allocate` using fast-check | Codex | ✔ |
+| 1.1 | `money.ts` — `Minor`, `Money`, add/sub/negate/abs/compare, `allocate()` largest-remainder, `parseMinor`, `formatMinor`. **Reference implementation — written first, reviewed by hand.** | Main | — |
+| 1.2 | `errors.ts` — full `AppError` taxonomy from §15.1 | Sub | ✔ |
+| 1.3 | `ledger/transaction.ts` — `assertSplitsBalance`, sign normalization per account kind, valid status transitions | Main | — |
+| 1.4 | `ledger/transfer.ts` — pair validation: distinct accounts, opposite signs, magnitude within tolerance, date proximity window | Par | ✔ |
+| 1.5 | `categorization/rule-matcher.ts` — all five match types, priority ordering, first-match-wins, ReDoS-safe regex evaluation | Par | ✔ |
+| 1.6 | `categorization/confidence.ts` — threshold routing to `categorized` vs `needs_review` | Par | ✔ |
+| 1.7 | `recurring/detector.ts` — periodicity inference from date deltas, MAD-based amount tolerance, cadence classification, `nextExpectedAt` | Par | ✔ |
+| 1.8 | Property tests for `allocate` using fast-check | Sub | ✔ |
+
+Two worktrees is enough here: one on `feat/domain-categorization` (1.5, 1.6), one on `feat/domain-recurring` (1.7), while the main session does 1.1 and 1.3.
 
 ### The sign-convention test comes first
 
-Before any of 1.3 lands, write the table-driven test enumerating every combination of account kind × direction × institution sign, straight from §6.3. Hand it to Codex as the specification. Getting this backwards for credit cards is the defect that silently poisons every aggregate in the system, and it is much cheaper to catch as a red test than as a wrong dashboard number in Phase 6.
+Before 1.3 begins, write the table-driven test enumerating every combination of account kind × direction × institution sign, straight from §6.3. That test file is the specification. Getting this backwards for credit cards is the defect that silently poisons every aggregate in the system, and it is much cheaper to catch as a red test than as a wrong dashboard number in Phase 6.
+
+This is also why 1.3 stays in the main session rather than going to a worktree — it is the one pure module where a plausible-looking wrong implementation is genuinely dangerous.
 
 ### `allocate` property tests
 
@@ -330,9 +383,9 @@ fc.assert(fc.property(fc.bigInt(), fc.array(fc.nat(), {minLength: 1}), (total, w
 
 ### Traps
 
-- **Bigint serialization.** `JSON.stringify` throws on `bigint`. Decide the boundary convention now (string at the API edge, per §6.4) and put it in `AGENTS.md`, or every module reinvents it differently.
-- **Regex rules are user input.** `merchant_regex` is a ReDoS vector. Either compile with a linear-time engine or enforce a match timeout. Codex will not do this unless told.
-- **The recurring detector is the one genuinely hard pure function here.** Give it real fixture data — 24 months of a Netflix charge with one price increase and one skipped month — rather than a synthetic evenly-spaced series.
+- **Bigint serialization.** `JSON.stringify` throws on `bigint`. Decide the boundary convention now (string at the API edge, per §6.4) and put it in `CLAUDE.md`, or every module reinvents it differently.
+- **Regex rules are user input.** `merchant_regex` is a ReDoS vector. Either compile with a linear-time engine or enforce a match timeout. A session will not do this unless the task brief says so.
+- **The recurring detector is the one genuinely hard pure function here.** Give it real fixture data — 24 months of a subscription charge with one price increase and one skipped month — rather than a synthetic evenly-spaced series.
 
 ---
 
@@ -340,7 +393,7 @@ fc.assert(fc.property(fc.bigInt(), fc.array(fc.nat(), {minLength: 1}), (total, w
 
 **Objective:** The schema exists, the invariants are enforced by Postgres, and the test harness can prove it.
 **Depends on:** 1.
-**Owner:** Claude Code for triggers and infrastructure patterns; Codex for schema transcription.
+**Mode:** Main. Triggers and infrastructure patterns are not delegable; transcription is.
 
 ### Deliverables
 
@@ -356,18 +409,18 @@ tests/helpers/factories.ts
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 2.1 | `db/client.ts` — Drizzle instance, pool config, bigint mode, custom `tsvector` type | Claude Code | — |
-| 2.2 | Schema files transcribed verbatim from §7.1–§7.11 | Codex | ✔ (split by file) |
-| 2.3 | Generate `0000_initial_schema.sql`, review generated SQL line by line | Claude Code | — |
-| 2.4 | `0001_invariant_triggers.sql` — hand-written | Claude Code | — |
-| 2.5 | `ScopedRepository` base + `UnitOfWork` with `afterCommit` hooks | Claude Code | — |
-| 2.6 | `transaction.repository.ts` — **reference repository**, incl. keyset pagination query | Claude Code | — |
-| 2.7 | Remaining repositories against the reference pattern | Codex | ✔ |
-| 2.8 | `test-db.ts` — Testcontainers, per-suite database, migration on boot, truncate between tests | Claude Code | — |
-| 2.9 | `factories.ts` — domain object builders | Codex | ✔ |
-| 2.10 | Integration test suite for triggers | Codex (cases enumerated by you) | ✔ |
+| 2.1 | `db/client.ts` — Drizzle instance, pool config, bigint mode, custom `tsvector` type | Main | — |
+| 2.2 | Schema files transcribed verbatim from §7.1–§7.11 | Sub | ✔ |
+| 2.3 | Generate `0000_initial_schema.sql`, review generated SQL line by line | Main | — |
+| 2.4 | `0001_invariant_triggers.sql` — hand-written | Main | — |
+| 2.5 | `ScopedRepository` base + `UnitOfWork` with `afterCommit` hooks | Main | — |
+| 2.6 | `transaction.repository.ts` — **reference repository**, incl. keyset pagination query | Main | — |
+| 2.7 | Remaining repositories against the reference pattern | Par | ✔ |
+| 2.8 | `test-db.ts` — Testcontainers, per-suite database, migration on boot, truncate between tests | Main | — |
+| 2.9 | `factories.ts` — domain object builders | Sub | ✔ |
+| 2.10 | Integration test suite for triggers | Sub (`test-writer`, cases enumerated by you) | ✔ |
 
 ### Triggers to hand-write (2.4)
 
@@ -401,6 +454,7 @@ That last column is where these go wrong. A trigger that handles `INSERT` and fo
 - **The deferred trigger.** If it is not `DEFERRABLE INITIALLY DEFERRED`, every split rewrite fails mid-statement and you will be tempted to move the check into application code. Do not. Fix the trigger.
 - **Testcontainers startup cost.** Reuse one container per suite file, not per test. Truncate between tests instead of recreating. The difference is 60 seconds versus 15 minutes.
 - **Review the generated migration by hand once.** Drizzle's output is legible — that is the whole reason it was chosen over Prisma (ADR-003). Actually reading it here is what makes the choice defensible in an interview.
+- **Do not run integration tests from two worktrees at once** against the same Docker daemon without distinct database names. Flaky failures here will cost you a day of misdirected debugging.
 
 ---
 
@@ -408,7 +462,7 @@ That last column is where these go wrong. A trigger that handles `INSERT` and fo
 
 **Objective:** A running HTTP server with correct error contracts and production-grade auth.
 **Depends on:** 2.
-**Owner:** Claude Code. Security-critical; the review cost of delegating exceeds the build cost.
+**Mode:** Main. Security-critical; watch this one get written.
 
 ### Deliverables
 
@@ -421,18 +475,18 @@ src/modules/health/
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 3.1 | Fastify bootstrap, `fastify-type-provider-zod`, graceful shutdown | Claude Code | — |
-| 3.2 | `request-context.plugin` — ULID request ID, child logger, `AsyncLocalStorage` | Claude Code | — |
-| 3.3 | `error-handler.plugin` — `AppError` → RFC 9457; PG `23505` → `ConflictError`; generic 500 leaking only `requestId` | Claude Code | — |
-| 3.4 | Auth service — argon2id (64MB/3/4), JWT HS256 15m, opaque refresh tokens hashed at rest | Claude Code | — |
-| 3.5 | Refresh rotation with `familyId` reuse detection + family revocation + audit | Claude Code | — |
-| 3.6 | `rate-limit.plugin` — tiered: 100/min general, 10/min assistant, 5/hr imports | Codex | ✔ |
-| 3.7 | `swagger.plugin` — OpenAPI from Zod, served at `/docs` | Codex | ✔ |
-| 3.8 | Default category tree seed data (used by `POST /auth/register`) | Codex | ✔ |
-| 3.9 | `/health`, `/health/ready` with per-dependency status | Codex | ✔ |
-| 3.10 | Auth test matrix (see below) | Codex (cases enumerated) | ✔ |
+| 3.1 | Fastify bootstrap, `fastify-type-provider-zod`, graceful shutdown | Main | — |
+| 3.2 | `request-context.plugin` — ULID request ID, child logger, `AsyncLocalStorage` | Main | — |
+| 3.3 | `error-handler.plugin` — `AppError` → RFC 9457; PG `23505` → `ConflictError`; generic 500 leaking only `requestId` | Main | — |
+| 3.4 | Auth service — argon2id (64MB/3/4), JWT HS256 15m, opaque refresh tokens hashed at rest | Main | — |
+| 3.5 | Refresh rotation with `familyId` reuse detection + family revocation + audit | Main | — |
+| 3.6 | `rate-limit.plugin` — tiered: 100/min general, 10/min assistant, 5/hr imports | Sub | ✔ |
+| 3.7 | `swagger.plugin` — OpenAPI from Zod, served at `/docs` | Sub | ✔ |
+| 3.8 | Default category tree seed data (used by `POST /auth/register`) | Sub | ✔ |
+| 3.9 | `/health`, `/health/ready` with per-dependency status | Sub | ✔ |
+| 3.10 | Auth test matrix (see below) | Sub (`test-writer`) | ✔ |
 
 ### Auth test matrix
 
@@ -459,7 +513,7 @@ src/modules/health/
 ### Traps
 
 - **The error handler is written once and used forever.** Get the Problem Details shape exactly right here, including the `errors[]` array for field-level validation failures, or you will be patching response shapes in eleven modules.
-- **`fastify-type-provider-zod` version alignment** with your Fastify 5 and Zod 3 versions is fiddly. This is a good use of Claude Code specifically, since it can run the server and read the actual type error rather than guessing.
+- **`fastify-type-provider-zod` version alignment** with Fastify 5 and Zod 3 is fiddly. This is exactly the kind of thing to keep in the main session, where the actual type error can be read rather than guessed at.
 
 ---
 
@@ -467,21 +521,21 @@ src/modules/health/
 
 **Objective:** Full CRUD over accounts, categories, and transactions, with audit logging throughout.
 **Depends on:** 3.
-**Owner:** Claude Code builds the canonical slice; Codex parallelizes the rest.
+**Mode:** Main builds the canonical slice, then two worktrees replicate.
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 4.1 | `audit` logger service, wired into the UoW | Claude Code | — |
-| 4.2 | `accounts` module end-to-end — **canonical vertical slice** | Claude Code | — |
-| 4.3 | `/accounts/:id/reconcile` — stored vs. computed balance | Codex | ✔ |
-| 4.4 | `categories` module: tree/flat, create, reparent, delete-with-reassignment, merge | Codex | ✔ |
-| 4.5 | `transactions` list: keyset pagination, all filters, FTS via `search_vector` | Claude Code | — |
-| 4.6 | Transaction create/patch/detail, splits replacement | Codex | ✔ |
-| 4.7 | Transfer link / unlink | Claude Code | — |
-| 4.8 | `bulk-categorize`, `/transactions/review` queue | Codex | ✔ |
-| 4.9 | Cursor encoding/decoding + stability tests | Claude Code | — |
+| 4.1 | `audit` logger service, wired into the UoW | Main | — |
+| 4.2 | `accounts` module end-to-end — **canonical vertical slice** | Main | — |
+| 4.3 | `/accounts/:id/reconcile` — stored vs. computed balance | Sub | ✔ |
+| 4.4 | `categories` module: tree/flat, create, reparent, delete-with-reassignment, merge | Par | ✔ |
+| 4.5 | `transactions` list: keyset pagination, all filters, FTS via `search_vector` | Main | — |
+| 4.6 | Transaction create/patch/detail, splits replacement | Par | ✔ |
+| 4.7 | Transfer link / unlink | Main | — |
+| 4.8 | `bulk-categorize`, `/transactions/review` queue | Par | ✔ |
+| 4.9 | Cursor encoding/decoding + stability tests | Main | — |
 
 ### Exit criteria
 
@@ -500,7 +554,7 @@ src/modules/health/
 
 ### Traps
 
-- **Build accounts first and completely.** Routes, service, schemas, tests, audit wiring, error cases. Then hand Codex the instruction "build `categories` following the exact structure of `src/modules/accounts`." The quality of every Codex module in this phase is downstream of how good the accounts module is.
+- **Build accounts first and completely.** Routes, service, schemas, tests, audit wiring, error cases. Then the brief for 4.4 and 4.6 is "follow the exact structure of `src/modules/accounts`." The quality of every replicated module in this phase is downstream of how good the accounts module is.
 - **The `categoryId` filter includes the subtree by default** (§13.1). Easy to miss; use the materialized path with `LIKE 'food/%'`, not a recursive CTE.
 - **Audit `before`/`after` payloads must serialize bigints.** They are `jsonb`; write the serializer once in the audit logger.
 
@@ -510,7 +564,7 @@ src/modules/health/
 
 **Objective:** Durable background processing, and the rollup read-model that dashboards depend on.
 **Depends on:** 4.
-**Owner:** Claude Code for the process topology; Codex for individual handlers.
+**Mode:** Main for process topology; subagents for individual handlers and admin routes.
 
 ### Deliverables
 
@@ -523,18 +577,18 @@ src/modules/admin/
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 5.1 | `main-worker.ts` — separate entrypoint, shared domain, DI container | Claude Code | — |
-| 5.2 | `queues.ts` — all five queues with §11.1 concurrency/retry/backoff | Claude Code | — |
-| 5.3 | `JobHandler<T>` type + dependency injection shape | Claude Code | — |
-| 5.4 | Scheduler with Redis-lock guard for repeatable jobs | Claude Code | — |
-| 5.5 | Graceful shutdown: SIGTERM → stop acquisition → 30s drain → close pools | Claude Code | — |
-| 5.6 | `compute-rollups.job.ts` — full period recompute + dirty-set drain | Claude Code | — |
-| 5.7 | Dead-letter capture with full error context | Codex | ✔ |
-| 5.8 | `/admin/jobs`, `/admin/jobs/failed`, `/admin/jobs/:id/retry`, `/admin/audit` | Codex | ✔ |
-| 5.9 | `prune-audit.job.ts`, `hard-delete-expired.job.ts` (90-day soft-delete sweep) | Codex | ✔ |
-| 5.10 | Job idempotency test suite | Codex (cases enumerated) | ✔ |
+| 5.1 | `main-worker.ts` — separate entrypoint, shared domain, DI container | Main | — |
+| 5.2 | `queues.ts` — all five queues with §11.1 concurrency/retry/backoff | Main | — |
+| 5.3 | `JobHandler<T>` type + dependency injection shape | Main | — |
+| 5.4 | Scheduler with Redis-lock guard for repeatable jobs | Main | — |
+| 5.5 | Graceful shutdown: SIGTERM → stop acquisition → 30s drain → close pools | Main | — |
+| 5.6 | `compute-rollups.job.ts` — full period recompute + dirty-set drain | Main | — |
+| 5.7 | Dead-letter capture with full error context | Sub | ✔ |
+| 5.8 | `/admin/jobs`, `/admin/jobs/failed`, `/admin/jobs/:id/retry`, `/admin/audit` | Sub | ✔ |
+| 5.9 | `prune-audit.job.ts`, `hard-delete-expired.job.ts` (90-day soft-delete sweep) | Sub | ✔ |
+| 5.10 | Job idempotency test suite | Sub (`test-writer`) | ✔ |
 
 ### Exit criteria
 
@@ -554,28 +608,28 @@ src/modules/admin/
 
 - **The enqueue-before-commit race is the subtle one.** It is also the thing most worth demonstrating you understood. Write the test that proves `afterCommit` fixes it, and keep it — it is a good interview artifact.
 - **BullMQ repeatable jobs duplicate** if two workers register them. The Redis lock is not optional even at one instance, because dev restarts will do it to you.
-- **Rollup SQL must be a full recompute**, per ADR-006. Any increment-based optimization here forfeits the self-healing property that makes a missed dirty-mark survivable.
+- **Rollup SQL must be a full recompute**, per ADR-006. Any increment-based optimization here forfeits the self-healing property that makes a missed dirty-mark survivable. A session will propose the optimization; decline it.
 
 ---
 
 ## Phase 6 — Read Models: Insights & Budgets
 
 **Objective:** Every dashboard and assistant read answered from rollups, never from a transaction scan.
-**Depends on:** 5. **Runs concurrently with Phase 7.**
-**Owner:** Codex, with Claude Code reviewing the aggregate SQL.
+**Depends on:** 5. **Runs concurrently with Phase 7 as a separate worktree.**
+**Mode:** Par, with the `sql-reviewer` subagent auditing the aggregates.
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 6.1 | `budgets` module — CRUD with effective-dating supersede semantics | Codex | ✔ |
-| 6.2 | `GET /budgets/status` — budget vs. actual, subtree-aware | Codex | ✔ |
-| 6.3 | `GET /insights/spending` | Codex | ✔ |
-| 6.4 | `GET /insights/trends` — month-over-month by category | Codex | ✔ |
-| 6.5 | `GET /insights/cashflow` | Codex | ✔ |
-| 6.6 | `GET /insights/net-worth` — balance across accounts over time | Codex | ✔ |
-| 6.7 | `GET /insights/recurring` (shell; populated in Phase 8) | Codex | ✔ |
-| 6.8 | Review pass on all aggregate SQL | Claude Code | — |
+| 6.1 | `budgets` module — CRUD with effective-dating supersede semantics | Par | ✔ |
+| 6.2 | `GET /budgets/status` — budget vs. actual, subtree-aware | Par | ✔ |
+| 6.3 | `GET /insights/spending` | Par | ✔ |
+| 6.4 | `GET /insights/trends` — month-over-month by category | Par | ✔ |
+| 6.5 | `GET /insights/cashflow` | Par | ✔ |
+| 6.6 | `GET /insights/net-worth` — balance across accounts over time | Par | ✔ |
+| 6.7 | `GET /insights/recurring` (shell; populated in Phase 8) | Par | ✔ |
+| 6.8 | Review pass on all aggregate SQL | Sub (`sql-reviewer`) | — |
 
 ### Exit criteria
 
@@ -600,23 +654,23 @@ src/modules/admin/
 ## Phase 7 — Import Pipeline
 
 **Objective:** Robust, reversible, deduplicated CSV ingestion.
-**Depends on:** 5. **Runs concurrently with Phase 6.**
-**Owner:** Codex — parsers are pure and fixture-testable, which is exactly its strength.
+**Depends on:** 5. **Runs concurrently with Phase 6 as a separate worktree.**
+**Mode:** Par for the parsers; Main for the upload surface and job orchestration.
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 7.1 | `parsers/normalize.ts` — merchant string cleanup | Codex | ✔ |
-| 7.2 | `parsers/csv/csv-parser.ts` — streaming, delimiter sniffing, BOM/CRLF, row ceiling | Codex | ✔ |
-| 7.3 | `column-mapper.ts` tier 1: bank profile registry keyed by header signature | Codex | ✔ |
-| 7.4 | `column-mapper.ts` tier 2: header heuristics | Codex | ✔ |
-| 7.5 | `column-mapper.ts` tier 3: value-shape inference over 20 sample rows | Codex | ✔ |
-| 7.6 | Fixture corpus: ≥8 real-world CSV shapes | Codex | ✔ |
-| 7.7 | Upload endpoint: multipart, MIME sniffing on content, 10MB cap, file hash | Claude Code | — |
-| 7.8 | Dedup hash with `occurrenceIndex` disambiguation | Claude Code | — |
-| 7.9 | `process-import.job.ts` — staging → parse → bulk insert `ON CONFLICT DO NOTHING` → outcomes | Claude Code | — |
-| 7.10 | Mapping confirm, preview, commit, revert endpoints | Codex | ✔ |
+| 7.1 | `parsers/normalize.ts` — merchant string cleanup | Par | ✔ |
+| 7.2 | `parsers/csv/csv-parser.ts` — streaming, delimiter sniffing, BOM/CRLF, row ceiling | Par | ✔ |
+| 7.3 | `column-mapper.ts` tier 1: bank profile registry keyed by header signature | Par | ✔ |
+| 7.4 | `column-mapper.ts` tier 2: header heuristics | Par | ✔ |
+| 7.5 | `column-mapper.ts` tier 3: value-shape inference over 20 sample rows | Par | ✔ |
+| 7.6 | Fixture corpus: ≥8 real-world CSV shapes | Sub (`fixture-builder`) | ✔ |
+| 7.7 | Upload endpoint: multipart, MIME sniffing on content, 10MB cap, file hash | Main | — |
+| 7.8 | Dedup hash with `occurrenceIndex` disambiguation | Main | — |
+| 7.9 | `process-import.job.ts` — staging → parse → bulk insert `ON CONFLICT DO NOTHING` → outcomes | Main | — |
+| 7.10 | Mapping confirm, preview, commit, revert endpoints | Par | ✔ |
 
 ### Required fixture shapes (7.6)
 
@@ -629,6 +683,8 @@ no header row at all                 trailing summary/total row
 currency symbols and thousands separators in amounts
 negative amounts in parentheses: (1,234.56)
 ```
+
+Build the fixtures **before** the mappers. They are the specification for tiers 2 and 3, and a mapper written first will be tested against fixtures shaped to fit it.
 
 ### Exit criteria
 
@@ -647,7 +703,7 @@ negative amounts in parentheses: (1,234.56)
 ### Traps
 
 - **Date ambiguity.** `01/02/2026` is genuinely undecidable from one row. Scan the whole column for any first-position value above 12; if none exists, return `mapping_required`. Guessing here silently corrupts eleven months of data.
-- **Resist using the model for column mapping.** §9.2 is explicit that this is deterministic. An agent may propose it as a shortcut. Decline — the restraint is itself part of what the project demonstrates.
+- **Resist using the model for column mapping.** §9.2 is explicit that this is deterministic. A session may propose it as a shortcut. Decline — the restraint is itself part of what the project demonstrates.
 - **Streaming, not buffering.** `readFile` then `split('\n')` will pass every test in the fixture corpus and fall over on the one large file a reviewer tries.
 
 ---
@@ -656,21 +712,21 @@ negative amounts in parentheses: (1,234.56)
 
 **Objective:** The full cascade, minus the AI tier. Prove how much resolves without a model.
 **Depends on:** 7.
-**Owner:** Claude Code for the cascade orchestrator; Codex for rules CRUD and job wiring.
+**Mode:** Main for the cascade orchestrator; Par for rules CRUD and job wiring.
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 8.1 | Cascade orchestrator — tier ordering, status transitions, audit attribution | Claude Code | — |
-| 8.2 | Tier 1: transfer heuristic (opposite signs, magnitude match, date window, distinct accounts) | Claude Code | — |
-| 8.3 | Tier 2: active recurring-series match | Codex | ✔ |
-| 8.4 | Tier 3: enabled rules in priority order, `matchCount` / `lastMatchedAt` update | Codex | ✔ |
-| 8.5 | Tier 4: merchant history — prior manual categorization, confidence 0.95 | Codex | ✔ |
-| 8.6 | `rules` module: CRUD, `POST /rules/preview` dry-run, `POST /rules/:id/apply` backfill | Codex | ✔ |
-| 8.7 | `detect-recurring.job.ts` wrapping the Phase 1 detector | Codex | ✔ |
-| 8.8 | Learning from corrections: offer rule creation on manual override, `createdFromCorrection` | Claude Code | — |
-| 8.9 | `categorize-batch.job.ts` with the AI tier stubbed as a no-op | Claude Code | — |
+| 8.1 | Cascade orchestrator — tier ordering, status transitions, audit attribution | Main | — |
+| 8.2 | Tier 1: transfer heuristic (opposite signs, magnitude match, date window, distinct accounts) | Main | — |
+| 8.3 | Tier 2: active recurring-series match | Par | ✔ |
+| 8.4 | Tier 3: enabled rules in priority order, `matchCount` / `lastMatchedAt` update | Par | ✔ |
+| 8.5 | Tier 4: merchant history — prior manual categorization, confidence 0.95 | Par | ✔ |
+| 8.6 | `rules` module: CRUD, `POST /rules/preview` dry-run, `POST /rules/:id/apply` backfill | Par | ✔ |
+| 8.7 | `detect-recurring.job.ts` wrapping the Phase 1 detector | Par | ✔ |
+| 8.8 | Learning from corrections: offer rule creation on manual override, `createdFromCorrection` | Main | — |
+| 8.9 | `categorize-batch.job.ts` with the AI tier stubbed as a no-op | Main | — |
 
 ### Exit criteria
 
@@ -700,34 +756,33 @@ negative amounts in parentheses: (1,234.56)
 
 **Objective:** A metered, validated, fail-safe model integration. No assistant yet — just categorization.
 **Depends on:** 8.
-**Owner:** Claude Code. This is adversarial design work.
+**Mode:** Main. This is adversarial design work.
 
 ### Deliverables
 
 ```
 src/ai/{provider.interface,anthropic.provider,openai.provider,mock.provider}.ts
-src/ai/{structured-output,token-budget}.ts
-src/ai/circuit-breaker.ts
+src/ai/{structured-output,token-budget,circuit-breaker}.ts
 src/modules/assistant/prompts/categorizer.system.ts
 tests/fixtures/ai/{recorded,adversarial}/
 ```
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 9.1 | `LLMProvider` interface per §12.2 | Claude Code | — |
-| 9.2 | `AnthropicProvider` — completion + tool use, token accounting | Claude Code | — |
-| 9.3 | `MockProvider` — scripted responses keyed by input hash | Claude Code | — |
-| 9.4 | `OpenAIProvider` — mirror of the Anthropic implementation | Codex | ✔ |
-| 9.5 | `structured-output.ts` — two-layer validation per §10.3 | Claude Code | — |
-| 9.6 | `token-budget.ts` — per-user daily ceiling, optimistic reservation | Claude Code | — |
-| 9.7 | Circuit breaker: 5 consecutive failures → open 60s | Codex | ✔ |
-| 9.8 | `ai_interactions` metering on every call | Codex | ✔ |
-| 9.9 | Categorization response cache keyed by `sha256(merchant + categorySetVersion)` | Codex | ✔ |
-| 9.10 | Merchant-grouped batching, 40-merchant cap | Claude Code | — |
-| 9.11 | `categorizer.system.ts` prompt | Claude Code | — |
-| 9.12 | Adversarial fixture corpus | Codex (cases enumerated) | ✔ |
+| 9.1 | `LLMProvider` interface per §12.2 | Main | — |
+| 9.2 | `AnthropicProvider` — completion + tool use, token accounting | Main | — |
+| 9.3 | `MockProvider` — scripted responses keyed by input hash | Main | — |
+| 9.4 | `OpenAIProvider` — mirror of the Anthropic implementation | Sub | ✔ |
+| 9.5 | `structured-output.ts` — two-layer validation per §10.3 | Main | — |
+| 9.6 | `token-budget.ts` — per-user daily ceiling, optimistic reservation | Main | — |
+| 9.7 | Circuit breaker: 5 consecutive failures → open 60s | Sub | ✔ |
+| 9.8 | `ai_interactions` metering on every call | Sub | ✔ |
+| 9.9 | Categorization response cache keyed by `sha256(merchant + categorySetVersion)` | Sub | ✔ |
+| 9.10 | Merchant-grouped batching, 40-merchant cap | Main | — |
+| 9.11 | `categorizer.system.ts` prompt | Main | — |
+| 9.12 | Adversarial fixture corpus | Sub (`fixture-builder`) | ✔ |
 
 ### Adversarial fixtures (9.12) — each must be rejected with the correct error
 
@@ -762,7 +817,7 @@ correct JSON with an extra unexpected top-level key
 ### Traps
 
 - **Validate semantically, not just structurally.** A well-formed UUID that does not exist in the user's category table is the failure mode; `z.string().uuid()` will happily accept it. Both checks, always.
-- **Provider outage must degrade, not fail.** An import that dies because Anthropic returned 529 is a broken pipeline. The correct behavior is `needs_review`.
+- **Provider outage must degrade, not fail.** An import that dies because the provider returned 529 is a broken pipeline. The correct behavior is `needs_review`.
 - **Record real fixtures during development.** Call the real API by hand a dozen times, save the raw responses, and replay them forever after. This is what makes the AI path testable without spend.
 
 ---
@@ -771,25 +826,25 @@ correct JSON with an extra unexpected top-level key
 
 **Objective:** Natural-language querying over a read-only, capability-scoped tool surface.
 **Depends on:** 6 and 9.
-**Owner:** Claude Code for the loop and prompt; Codex for individual tools.
+**Mode:** Main for the registry, loop, and prompt; Par for the individual tools.
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 10.1 | `tools/registry.ts` — no mechanism exists to register a mutating handler | Claude Code | — |
-| 10.2 | `get_spending_by_category` | Codex | ✔ |
-| 10.3 | `get_transactions` | Codex | ✔ |
-| 10.4 | `get_budget_status` | Codex | ✔ |
-| 10.5 | `get_recurring_charges` | Codex | ✔ |
-| 10.6 | `get_account_summary` | Codex | ✔ |
-| 10.7 | `compare_periods` | Codex | ✔ |
-| 10.8 | `assistant.service.ts` — tool loop with a hard round-trip cap | Claude Code | — |
-| 10.9 | `buildAssistantSystemPrompt` from live user data | Claude Code | — |
-| 10.10 | `POST /assistant/query`, `GET /assistant/history`, `GET /assistant/usage` | Codex | ✔ |
-| 10.11 | Security test suite (below) | Claude Code | — |
+| 10.1 | `tools/registry.ts` — no mechanism exists to register a mutating handler | Main | — |
+| 10.2 | `get_spending_by_category` | Par | ✔ |
+| 10.3 | `get_transactions` | Par | ✔ |
+| 10.4 | `get_budget_status` | Par | ✔ |
+| 10.5 | `get_recurring_charges` | Par | ✔ |
+| 10.6 | `get_account_summary` | Par | ✔ |
+| 10.7 | `compare_periods` | Par | ✔ |
+| 10.8 | `assistant.service.ts` — tool loop with a hard round-trip cap | Main | — |
+| 10.9 | `buildAssistantSystemPrompt` from live user data | Main | — |
+| 10.10 | `POST /assistant/query`, `GET /assistant/history`, `GET /assistant/usage` | Par | ✔ |
+| 10.11 | Security test suite (below) | Main | — |
 
-Tasks 10.2 through 10.7 are six independent Codex tasks that can all run at once. Each is: one Zod input schema, one `userId`-scoped query hitting rollups where possible, one row cap, one test file. This is the phase where parallel agent execution pays off most.
+Tasks 10.2 through 10.7 are six independent, near-identical units: one Zod input schema, one `userId`-scoped query hitting rollups where possible, one row cap, one test file. Batch them two or three at a time in a single worktree session rather than spinning up six — the per-session overhead exceeds the work.
 
 ### Security test suite (10.11)
 
@@ -828,17 +883,19 @@ Tasks 10.2 through 10.7 are six independent Codex tasks that can all run at once
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 11.1 | `prom-client` registry, `/metrics` endpoint | Codex | ✔ |
-| 11.2 | Instrument all eight metrics from §17.2 | Codex | ✔ |
-| 11.3 | Pino redaction serializer for all sensitive keys | Codex | ✔ |
-| 11.4 | requestId correlation test: log line → audit row → response | Codex | ✔ |
-| 11.5 | Security review pass | Claude Code | — |
-| 11.6 | Performance pass on 100k transactions | Claude Code | — |
-| 11.7 | Raise CI coverage gates to the §18.4 targets | Claude Code | — |
+| 11.1 | `prom-client` registry, `/metrics` endpoint | Sub | ✔ |
+| 11.2 | Instrument all eight metrics from §17.2 | Sub | ✔ |
+| 11.3 | Pino redaction serializer for all sensitive keys | Sub | ✔ |
+| 11.4 | requestId correlation test: log line → audit row → response | Sub | ✔ |
+| 11.5 | Security review pass | Sub (`invariant-auditor`) → Main to fix | — |
+| 11.6 | Performance pass on 100k transactions | Main | — |
+| 11.7 | Raise CI coverage gates to the §18.4 targets | Main | — |
 
 ### Security review checklist (11.5)
+
+Run this as a fresh-context audit, not as a continuation of the session that built the thing.
 
 ```
 □ Rate limits present and effective on all three tiers
@@ -884,14 +941,14 @@ The deep-page target is the interesting one — it is what ADR-007 claims, and m
 
 ### Tasks
 
-| # | Task | Owner | Parallel |
+| # | Task | Mode | Par. |
 |---|---|---|---|
-| 12.1 | `scripts/seed.ts` — 18 months of realistic synthetic data | Codex | ✔ |
-| 12.2 | `scripts/reset-db.ts` | Codex | ✔ |
-| 12.3 | Minimal web UI: dashboard, transaction list, review queue, assistant chat | Codex | ✔ |
-| 12.4 | README: what it is, why the design, 60-second quickstart, perf numbers | Claude Code | — |
-| 12.5 | ADRs extracted to `docs/adr/` as individual files | Codex | ✔ |
-| 12.6 | Export OpenAPI spec to `docs/openapi.json`, render diagrams | Codex | ✔ |
+| 12.1 | `scripts/seed.ts` — 18 months of realistic synthetic data | Par | ✔ |
+| 12.2 | `scripts/reset-db.ts` | Sub | ✔ |
+| 12.3 | Minimal web UI: dashboard, transaction list, review queue, assistant chat | Par | ✔ |
+| 12.4 | README: what it is, why the design, 60-second quickstart, perf numbers | Main | — |
+| 12.5 | ADRs extracted to `docs/adr/` as individual files | Sub | ✔ |
+| 12.6 | Export OpenAPI spec to `docs/openapi.json`, render diagrams | Sub | ✔ |
 | 12.7 | Clean-machine rehearsal | You | — |
 | 12.8 | Demo script + short screencast | You | — |
 
@@ -937,12 +994,12 @@ The seed script carries disproportionate weight (§19.2). It must produce:
 | Gate | When | Command |
 |---|---|---|
 | Pre-commit | Every commit | `npm run verify` |
-| Pre-PR | Before requesting review | `npm run verify:full` |
-| Review | Every Codex PR | Claude Code `/review-pr` |
-| Phase exit | End of phase | Every exit criterion, on a clean checkout |
+| Pre-PR | Before merging a branch | `npm run verify:full` |
+| Review | Every branch you did not watch being written | `/review <branch>` in a fresh session |
+| Phase exit | End of phase | `/exit-audit <n>` on a clean checkout |
 | Pre-release | Phase 12 | Clean-machine rehearsal |
 
-### 13.2 Things no agent may do without your explicit approval
+### 13.2 Things no session may do without your explicit approval
 
 1. Edit a migration that exists in `HEAD`
 2. Add a runtime dependency
@@ -953,39 +1010,49 @@ The seed script carries disproportionate weight (§19.2). It must produce:
 7. Remove a `userId` parameter from a repository signature
 8. Introduce floating-point arithmetic anywhere in the money path
 
-Items 1, 5, 6, 7, and 8 belong in hooks or lint rules, not just in prose. Enforcement beats instruction.
+Items 1, 5, 7, and 8 belong in hooks or lint rules, not just in prose. Enforcement beats instruction, and item 4 in particular is the one a stuck session will reach for.
 
-### 13.3 Standing Claude Code prompts
+### 13.3 Standing prompts
 
-**Phase kickoff:**
+**Phase kickoff** (`/phase <n>`):
 
 ```
 Read docs/ARCHITECTURE.md §<sections> and NUMERAIRE-PIPELINE.md Phase <n>.
-Use plan mode. Produce an implementation plan covering only the tasks assigned
-to Claude Code in that phase's table. For each Codex-assigned task, draft the
-task spec instead of implementing it. Flag anything in the phase that the
-architecture document leaves genuinely ambiguous — do not resolve it yourself.
+Use plan mode. Produce an implementation plan for the tasks marked Main.
+For each task marked Par or Sub, draft the task brief instead of implementing
+it. Flag anything the architecture document leaves genuinely ambiguous — do
+not resolve it yourself.
 ```
 
-**Codex PR review:**
+**Branch review** (`/review <branch>`, run in a fresh session):
 
 ```
-Review this diff against AGENTS.md and NUMERAIRE-PIPELINE.md §1.4.
-Report violations of the non-negotiable invariants first, then test quality,
-then everything else. Do not fix anything yet — report first.
+Review `git diff main...<branch>` against CLAUDE.md and
+NUMERAIRE-PIPELINE.md §1.4. Report violations of the non-negotiable
+invariants first, then test quality, then everything else.
+Do not fix anything. Report only.
 ```
 
-**Phase exit audit:**
+**Phase exit audit** (`/exit-audit <n>`):
 
 ```
 Run npm run verify:full. Then verify each exit criterion for Phase <n>
-individually and report pass/fail per line, citing the test that proves it.
-If a criterion has no test proving it, say so rather than inferring it passes.
+individually and report pass/fail per line, citing the specific test that
+proves it. If a criterion has no test proving it, say so rather than
+inferring it passes.
 ```
 
-That last instruction matters. An exit criterion nobody wrote a test for is not met, and an agent asked to confirm a checklist will tend to confirm it.
+That last instruction matters. An exit criterion nobody wrote a test for is not met, and a session asked to confirm a checklist will tend to confirm it.
 
-### 13.4 Risk register
+### 13.4 Context management
+
+Long phases will exhaust context. Three habits that keep quality from degrading across a compaction boundary:
+
+- **Delegate large reads.** Codebase exploration, log analysis, and dependency audits go to a subagent so the intermediate output never enters your main thread.
+- **Commit at every green.** A compaction that follows a commit is recoverable; one that follows two hours of uncommitted work is not.
+- **Restart at phase boundaries.** Begin each phase in a fresh session with `/phase <n>` rather than continuing a compacted thread from the previous phase. Context carried across a phase boundary is mostly stale, and stale context is worse than none.
+
+### 13.5 Risk register
 
 | Risk | Phase | Mitigation |
 |---|---|---|
@@ -997,7 +1064,8 @@ That last instruction matters. An exit criterion nobody wrote a test for is not 
 | Model returns valid-looking but wrong IDs | 9 | Semantic validation against real rows |
 | Prompt injection via merchant strings | 9, 10 | No write capability + delimited untrusted data + fixture test |
 | Cost overrun during development | 9 | `MockProvider` default, budget ceiling, response cache |
-| Agent-generated code drifts from the architecture | All | Mandatory review gate, boundary enforcement, ADR discipline |
+| Generated code drifts from the architecture | All | Fresh-context review gate, boundary enforcement, ADR discipline |
+| Parallel worktrees diverge or collide | 1, 4, 6, 7, 10 | Disjoint file sets, rebase before review, max 2–3 concurrent |
 | Scope creep into deferred features | All | §21 is the boundary; extensions go in a follow-up milestone |
 
 ---
