@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# ...except the invariant-checker fixture, which exists precisely to prove the
+# checker never descends into a node_modules directory. Ignoring it would make
+# that assertion pass vacuously on a fresh clone.
+!tests/fixtures/invariants/**/node_modules/
+!tests/fixtures/invariants/**/node_modules/**
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test / coverage output
+coverage/
+.vitest/
+*.lcov
+
+# Environment — .env holds real secrets and is never committed.
+# .env.example is the committed contract and is explicitly re-included.
+.env
+.env.*
+!.env.example
+
+# Tool caches
+.eslintcache
+.cache/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Claude Code local overrides (settings.json itself IS committed)
+.claude/settings.local.json

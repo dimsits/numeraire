@@ -1,0 +1,35 @@
+# Normalize text files in the index. `text=auto` (rather than `eol=lf`) is
+# deliberate: this repository was created on Windows with core.autocrlf=true,
+# and forcing eol=lf globally would mark every pre-existing file as modified.
+* text=auto
+
+# Files that are executed by a POSIX shell, or copied into a Linux container,
+# must be LF in the working tree regardless of the host platform.
+*.sh          text eol=lf
+*.bash        text eol=lf
+Dockerfile    text eol=lf
+Dockerfile.*  text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+
+# Source and config authored by this project: LF everywhere, so Prettier's
+# `endOfLine: "lf"` check is stable on every platform.
+*.ts   text eol=lf
+*.mts  text eol=lf
+*.cts  text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.sql  text eol=lf
+
+# Lockfiles are generated; never diff or merge them by hand.
+package-lock.json -diff linguist-generated=true
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary

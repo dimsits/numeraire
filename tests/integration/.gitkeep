@@ -1,0 +1,6 @@
+Integration tests land here in Phase 2, against a real Postgres via
+Testcontainers (ARCHITECTURE.md §18.1, DEV_PIPELINE.md task 2.8).
+
+Until then `npm run test:integration` runs with --passWithNoTests. That flag is
+scoped to this one project and should be removed from package.json the moment
+the first test lands here.
