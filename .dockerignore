@@ -1,0 +1,30 @@
+# Never ship host-installed modules or build output into the image.
+node_modules
+dist
+coverage
+*.tsbuildinfo
+
+# Secrets and local state
+.env
+.env.*
+!.env.example
+
+# VCS and agent tooling
+.git
+.gitignore
+.gitattributes
+.github
+.claude
+
+# Docs and editor config add nothing to the runtime image
+docs
+*.md
+*.MD
+LICENSE
+.vscode
+.idea
+
+# Local container definitions
+docker-compose*.yml
+Dockerfile
+.dockerignore

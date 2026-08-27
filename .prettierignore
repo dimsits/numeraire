@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+package-lock.json
+
+# Generated SQL and drizzle metadata are written by drizzle-kit and are
+# immutable once committed (CLAUDE.md). Formatting them would rewrite history.
+drizzle/
+
+# Invariant-checker fixtures must stay byte-exact: they deliberately contain
+# the patterns the checker looks for, at known line numbers.
+tests/fixtures/
+
+# Markdown is authored by hand. Prettier reflows tables and list markers,
+# which would churn docs/ARCHITECTURE.MD and docs/DEV_PIPELINE.MD on every run.
+*.md
+*.MD
+LICENSE

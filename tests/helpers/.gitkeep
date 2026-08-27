@@ -1,0 +1,2 @@
+test-db.ts (Testcontainers lifecycle) and factories.ts (domain object builders)
+land here in Phase 2 — DEV_PIPELINE.md tasks 2.8 and 2.9.
