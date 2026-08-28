@@ -23,6 +23,18 @@ Dockerfile.*  text eol=lf
 *.json text eol=lf
 *.sql  text eol=lf
 
+# Extensionless dotfiles are matched only by `* text=auto` above, which leaves
+# them CRLF in a Windows working tree. `.prettierrc` sets `endOfLine: "lf"` and
+# Prettier checks its own config file, so without this `npm run format:check`
+# fails on a fresh Windows clone. The rest are listed so a future rename or a
+# new tool reading them does not re-open the same trap.
+.prettierrc     text eol=lf
+.prettierignore text eol=lf
+.gitignore      text eol=lf
+.dockerignore   text eol=lf
+.env.example    text eol=lf
+.nvmrc          text eol=lf
+
 # Lockfiles are generated; never diff or merge them by hand.
 package-lock.json -diff linguist-generated=true
 

@@ -11,7 +11,8 @@
        Rewritten to relative specifiers at build time by tsc-alias. */
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@tests/*": ["./tests/*"]
     },
 
     /* Strictness. `strict: true` plus additional checks only — nothing here
