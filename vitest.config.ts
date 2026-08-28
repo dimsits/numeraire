@@ -19,18 +19,30 @@ import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 /**
- * PHASE 0 BOOTSTRAP VALUE — raise this as coverage arrives.
- *
  * ARCHITECTURE.md §18.4 sets the real targets: src/domain/** 95%,
  * src/modules/**\/*.service.ts 80%, src/jobs/handlers/** 80%, overall 75%.
- * The gate starts at 0 so CI is honest about an almost-empty repository
- * rather than green because the threshold was never wired up. Phase 1 raises
- * the overall floor and adds the per-directory thresholds.
+ *
+ * Phase 1 wires up the first of those. `src/domain/**` is finished and fully
+ * tested, so it carries its real 95% gate below. The *overall* floor stays at
+ * the Phase 0 bootstrap value of 0 because the outer layers do not exist yet —
+ * raising it now would gate the build on code nobody has written. Each later
+ * phase raises this as its layer lands, ending at the §18.4 floor of 75.
+ *
+ * This is not a weakened threshold: files matched by a glob below are removed
+ * from the global group, so the 0 applies to strictly fewer files than it did
+ * in Phase 0, and src/domain gained a hard gate it did not have.
  */
-const PHASE_0_COVERAGE_THRESHOLD = 0;
+const OVERALL_COVERAGE_THRESHOLD = 0;
+
+/** §18.4: the domain layer is pure, cheap to cover, and highest consequence. */
+const DOMAIN_COVERAGE_THRESHOLD = 95;
 
 const alias = {
   '@': fileURLToPath(new URL('./src', import.meta.url)),
+  // Test-only helpers (tests/helpers/**). Kept outside src/ deliberately: it
+  // keeps them out of coverage, out of dependency-cruiser's graph, and out of
+  // check-invariants, none of which should be reasoning about test scaffolding.
+  '@tests': fileURLToPath(new URL('./tests', import.meta.url)),
 };
 
 export default defineConfig({
@@ -81,10 +93,16 @@ export default defineConfig({
         'src/main-worker.ts',
       ],
       thresholds: {
-        lines: PHASE_0_COVERAGE_THRESHOLD,
-        functions: PHASE_0_COVERAGE_THRESHOLD,
-        branches: PHASE_0_COVERAGE_THRESHOLD,
-        statements: PHASE_0_COVERAGE_THRESHOLD,
+        lines: OVERALL_COVERAGE_THRESHOLD,
+        functions: OVERALL_COVERAGE_THRESHOLD,
+        branches: OVERALL_COVERAGE_THRESHOLD,
+        statements: OVERALL_COVERAGE_THRESHOLD,
+        'src/domain/**': {
+          lines: DOMAIN_COVERAGE_THRESHOLD,
+          functions: DOMAIN_COVERAGE_THRESHOLD,
+          branches: DOMAIN_COVERAGE_THRESHOLD,
+          statements: DOMAIN_COVERAGE_THRESHOLD,
+        },
       },
     },
   },
